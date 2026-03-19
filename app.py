@@ -20,14 +20,20 @@ def t(en: str, vi: str) -> str:
 
 # --- API SECURITY & SETUP ---
 load_dotenv()
-gemini_key = os.getenv("GEMINI_KEY")
+if "GEMINI_KEY" in st.secrets:
+    gemini_key = st.secrets["GEMINI_KEY"]
+else:
+    gemini_key = os.getenv("GEMINI_KEY")
+
 if not gemini_key:
-    st.error(t("GEMINI API KEY is not configured in the .env file.", "Chưa cấu hình GEMINI API KEY trong file .env"))
+    # Tôi đã gộp thông báo lỗi để cho cả 2 trường hợp
+    st.error(t("GEMINI API KEY is not configured in Secrets or .env file.", "Chưa cấu hình GEMINI API KEY trong Streamlit Secrets hoặc file .env"))
     st.stop()
 
 genai.configure(api_key=gemini_key)
+
 # Using the requested model name. If the API rejects it, update to 'gemini-1.5-flash' or 'gemini-2.0-flash'
-MODEL_NAME = "gemini-3.1-flash-lite-preview" 
+MODEL_NAME = "gemini-3.1-flash-lite-preview"
 model = genai.GenerativeModel(MODEL_NAME)
 
 # --- SESSION STATE INITIALIZATION ---
