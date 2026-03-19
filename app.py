@@ -1,249 +1,323 @@
+import re
 import streamlit as st
 import pandas as pd
 import numpy as np
-import google.generativeai as genai
-import os
-from sklearn.impute import KNNImputer
 import io
+import sys
+import traceback
+import plotly.express as px
+import google.generativeai as genai
+from dotenv import load_dotenv
+import os
 
-# =============================================================================
-# 1. CẤU HÌNH TRANG & CSS
-# =============================================================================
-st.set_page_config(page_title="Data Prep & Chat Dashboard", layout="wide")
+# --- PAGE CONFIGURATION ---
+st.set_page_config(page_title="AI Data Analyst Agency", layout="wide", initial_sidebar_state="expanded")
 
-# CSS custom cho giao diện và nút Chat nổi (Góc dưới bên phải)
-st.markdown("""
-<style>
-    .floating-chat {
-        position: fixed;
-        bottom: 20px;
-        right: 20px;
-        z-index: 999;
-    }
-</style>
-""", unsafe_allow_html=True)
+# --- BILINGUAL DICTIONARY ---
+lang = st.sidebar.radio("🌐 Language / Ngôn ngữ", ["English", "Tiếng Việt"])
+def t(en: str, vi: str) -> str:
+    return en if lang == "English" else vi
 
-# Khởi tạo Gemini (Giả lập)
-GEMINI_API_KEY = ""
-# Cấu hình API Key (Nên dùng file .env để bảo mật)
-os.environ["GOOGLE_API_KEY"] = "GEMINI_KEY"
-genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
-# genai.configure(api_key=GEMINI_API_KEY)
-# model = genai.GenerativeModel('gemini-1.5-flash')
+# --- API SECURITY & SETUP ---
+load_dotenv()
+gemini_key = os.getenv("GEMINI_KEY")
+if not gemini_key:
+    st.error(t("GEMINI_KEY is not configured in the .env file.", "Chưa cấu hình GEMINI_API_KEY trong file .env"))
+    st.stop()
 
-# =============================================================================
-# 2. KHỞI TẠO SESSION STATE (QUẢN LÝ PHIÊN LÀM VIỆC ĐỘC LẬP)
-# =============================================================================
+genai.configure(api_key=gemini_key)
+# Using the requested model name. If the API rejects it, update to 'gemini-1.5-flash' or 'gemini-2.0-flash'
+MODEL_NAME = "gemini-3.1-flash-lite-preview" 
+model = genai.GenerativeModel(MODEL_NAME)
+
+# --- SESSION STATE INITIALIZATION ---
 if 'dfs' not in st.session_state:
-    st.session_state.dfs = {} # Lưu trữ các dataframe {tên_file: df}
+    st.session_state['dfs'] = {} # Stores ALL dataframes (inputs + generated)
 if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
+    st.session_state['chat_history'] = []
+if 'processed_files' not in st.session_state:
+    st.session_state['processed_files'] = set()
 
-# =============================================================================
-# 3. HÀM HELPER CHO CHATBOT (LẤY THỐNG KÊ MÔ TẢ)
-# =============================================================================
-def get_desc_stats(table_name: str, columns: list = None) -> str:
-    """Chatbot có thể gọi hàm này để lấy thống kê mô tả của bảng."""
-    if table_name not in st.session_state.dfs:
-        return f"Không tìm thấy bảng {table_name}"
+# --- HELPER: LLM DATETIME CONVERTER ---
+def identify_and_convert_datetime(df: pd.DataFrame, filename: str) -> pd.DataFrame:
+    columns_info = {col: str(dtype) for col, dtype in df.dtypes.items() if dtype == 'object'}
+    if not columns_info:
+        return df
     
-    df = st.session_state.dfs[table_name]
-    if columns:
-        # Lọc các cột có tồn tại trong df
-        valid_cols = [c for c in columns if c in df.columns]
-        if not valid_cols: return "Các cột yêu cầu không tồn tại."
-        df = df[valid_cols]
-        
-    stats = df.describe(include='all').to_string()
-    return f"Thống kê mô tả của {table_name}:\n{stats}"
+    prompt = f"""
+    Analyze these column names and their string types from a dataset: {columns_info}.
+    Return a comma-separated list of column names that likely contain dates or timestamps.
+    If none, return exactly "NONE". Do not explain, just return the list.
+    """
+    try:
+        response = model.generate_content(prompt)
+        result = response.text.strip().replace('`', '').strip()
+        if result.upper() != "NONE":
+            dt_cols = [c.strip() for c in result.split(',')]
+            for col in dt_cols:
+                if col in df.columns:
+                    try:
+                        df[col] = pd.to_datetime(df[col], format='mixed', errors='coerce')
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"Datetime LLM Error: {e}")
+    return df
 
-# =============================================================================
-# 4. SIDEBAR - UPLOAD DATA
-# =============================================================================
+# --- HELPER: SAFE PYTHON EXECUTION ---
+def run_python_code_safely(code: str) -> tuple[str, list]:
+    old_stdout = sys.stdout
+    redirected_output = sys.stdout = io.StringIO()
+    error_msg = None
+    new_df_names = []
+    
+    # Track existing keys before execution
+    initial_keys = set(st.session_state['dfs'].keys())
+
+    safe_globals = {
+        'pd': pd,
+        'np': np,
+        'px': px,
+        'st': st,
+        'dfs': st.session_state['dfs'], # Pass the dictionary of all dataframes
+        '__builtins__': __builtins__
+    }
+
+    try:
+        # Pre-process code to remove markdown wrappers if AI included them
+        clean_code = re.sub(r"^```python\n|```$", "", code, flags=re.MULTILINE).strip()
+        exec(clean_code, safe_globals, {})
+        output = redirected_output.getvalue()
+        
+        # Check if AI created new dataframes in the 'dfs' dictionary
+        current_keys = set(st.session_state['dfs'].keys())
+        new_keys = current_keys - initial_keys
+        
+        for k in new_keys:
+            if isinstance(st.session_state['dfs'][k], pd.DataFrame):
+                new_df_names.append(k)
+            else:
+                # Remove if they injected non-dataframes
+                del st.session_state['dfs'][k]
+
+    except Exception:
+        output = redirected_output.getvalue()
+        error_msg = f"❌ Execution Error:\n{traceback.format_exc()}"
+
+    sys.stdout = old_stdout
+    if error_msg:
+        return error_msg, []
+    return output.strip(), new_df_names
+
+# ==========================================
+# --- MAIN UI LAYOUT ---
+# ==========================================
+
+# 1. LEFT SIDEBAR (UPLOAD & STATS)
 with st.sidebar:
-    st.header("📂 Nhập Dữ Liệu")
+    st.header(t("1. Data Upload", "1. Tải Dữ Liệu"))
     uploaded_files = st.file_uploader(
-        "Tải lên tối đa 3 file CSV/Excel (Tối đa 30MB/file)", 
-        type=['csv', 'xlsx'], 
-        accept_multiple_files=True
+        t("Choose CSV files (Max 3, <=50MB)", "Chọn file CSV (Tối đa 3 file, <=50MB)"), 
+        type=["csv"], accept_multiple_files=True
     )
     
     if uploaded_files:
         if len(uploaded_files) > 3:
-            st.error("Chỉ được tải lên tối đa 3 file cùng lúc!")
-        else:
-            for file in uploaded_files:
-                if file.size > 30 * 1024 * 1024:
-                    st.error(f"File {file.name} vượt quá 30MB.")
-                    continue
+            st.warning(t("Please upload a maximum of 3 files.", "Vui lòng tải lên tối đa 3 file."))
+            uploaded_files = uploaded_files[:3]
+            
+        for file in uploaded_files:
+            if file.size > 50 * 1024 * 1024:
+                st.error(f"{file.name} " + t("exceeds 50MB limit.", "vượt quá giới hạn 50MB."))
+                continue
                 
-                # Lưu vào session_state nếu chưa có
-                if file.name not in st.session_state.dfs:
-                    try:
-                        if file.name.endswith('.csv'):
-                            df = pd.read_csv(file)
-                        else:
-                            df = pd.read_excel(file)
-                        st.session_state.dfs[file.name] = df
-                        st.success(f"Đã tải: {file.name}")
-                    except Exception as e:
-                        st.error(f"Lỗi đọc file {file.name}: {e}")
-
-# =============================================================================
-# 5. GIAO DIỆN CHÍNH (TABS)
-# =============================================================================
-tab1, tab2, tab3 = st.tabs(["📊 Tổng quan", "🛠️ Xử lý dữ liệu", "📈 Visualize (Comming Soon)"])
-
-# --- TAB 1: TỔNG QUAN ---
-with tab1:
-    if not st.session_state.dfs:
-        st.info("Vui lòng tải dữ liệu ở thanh bên trái.")
-    else:
-        for file_name, df in st.session_state.dfs.items():
-            st.subheader(f"📄 Bảng: {file_name}")
-            col_data, col_stats = st.columns([3, 2])
-            
-            with col_data:
-                # Giao diện Edit, Sort, Filter tích hợp sẵn của st.data_editor
-                # Chiều cao ~250px tương đương khoảng 6 dòng dữ liệu
-                edited_df = st.data_editor(df, height=250, use_container_width=True, key=f"editor_{file_name}")
-                st.session_state.dfs[file_name] = edited_df # Cập nhật lại data nếu có edit
-                
-                # Ép kiểu Timeseries
-                st.write("**Chuyển đổi Timeseries**")
-                ts_col = st.selectbox("Chọn cột:", [""] + list(edited_df.columns), key=f"ts_col_{file_name}")
-                if ts_col:
-                    ts_type = st.selectbox("Định dạng:", ["datetime", "date", "time"], key=f"ts_type_{file_name}")
-                    if st.button("Áp dụng ép kiểu", key=f"ts_btn_{file_name}"):
-                        try:
-                            if ts_type == "datetime":
-                                st.session_state.dfs[file_name][ts_col] = pd.to_datetime(edited_df[ts_col])
-                            elif ts_type == "date":
-                                st.session_state.dfs[file_name][ts_col] = pd.to_datetime(edited_df[ts_col]).dt.date
-                            elif ts_type == "time":
-                                st.session_state.dfs[file_name][ts_col] = pd.to_datetime(edited_df[ts_col]).dt.time
-                            st.success(f"Ép kiểu thành công cột {ts_col}")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Lỗi: Cột này không phải định dạng {ts_type} hợp lệ. Chi tiết: {e}")
-
-            with col_stats:
-                st.write("**Thống kê mô tả**")
-                cols_to_stat = st.multiselect("Chọn cột xem thống kê:", options=edited_df.columns, default=list(edited_df.columns), key=f"stat_cols_{file_name}")
-                if cols_to_stat:
-                    st.dataframe(edited_df[cols_to_stat].describe(include='all'), height=250, use_container_width=True)
-            st.divider()
-
-# --- TAB 2: XỬ LÝ DỮ LIỆU ---
-with tab2:
-    if st.session_state.dfs:
-        selected_table = st.selectbox("Chọn bảng cần xử lý:", list(st.session_state.dfs.keys()))
-        work_df = st.session_state.dfs[selected_table]
-        
-        c_stat, c_action = st.columns([1, 1])
-        
-        with c_stat:
-            st.write("**Thống kê hiện tại**")
-            st.dataframe(work_df.describe(), height=400)
-            
-        with c_action:
-            target_col = st.selectbox("Chọn cột xử lý:", work_df.columns)
-            action_type = st.radio("Hành động:", ["Xóa (Drop)", "Điền khuyết (Impute)"], horizontal=True)
-            
-            # Logic xác định điều kiện
-            condition = st.selectbox("Dựa trên:", ["NaN (Dữ liệu trống)", "Giá trị IQR (Outliers)", "Giá trị X cụ thể", "Ngưỡng (>, <, >=, <=)"])
-            
-            val_X = None
-            operator = None
-            if condition == "Giá trị X cụ thể":
-                val_X = st.text_input("Nhập X:")
-            elif condition == "Ngưỡng (>, <, >=, <=)":
-                col_op, col_val = st.columns(2)
-                operator = col_op.selectbox("Toán tử", [">", "<", ">=", "<="])
-                val_X = col_val.number_input("Nhập X (số):")
-
-            impute_method = None
-            if action_type == "Điền khuyết (Impute)":
-                impute_method = st.selectbox("Phương pháp:", ["mean", "median", "mode", "Giá trị nhập tay", "LOCF (Forward fill)", "NOCB (Backward fill)", "Linear Interpolation", "KNN"])
-                if impute_method == "Giá trị nhập tay":
-                    manual_val = st.text_input("Nhập giá trị thay thế:")
-            
-            if st.button("🚀 Execute", type="primary"):
+            if file.name not in st.session_state['processed_files']:
                 try:
-                    df_temp = work_df.copy()
+                    raw_df = pd.read_csv(file)
+                    # Use Gemini to auto-convert datetimes
+                    processed_df = identify_and_convert_datetime(raw_df, file.name)
+                    df_name = file.name.split('.')[0].replace(" ", "_")
                     
-                    # Bước 1: Xác định Mask (các dòng cần xử lý) và gán thành NaN nếu là Impute
-                    mask = pd.Series(False, index=df_temp.index)
-                    if condition == "NaN (Dữ liệu trống)":
-                        mask = df_temp[target_col].isna()
-                    elif condition == "Giá trị X cụ thể" and val_X is not None:
-                        mask = df_temp[target_col].astype(str) == str(val_X)
-                    elif condition == "Ngưỡng (>, <, >=, <=)" and val_X is not None:
-                        df_temp[target_col] = pd.to_numeric(df_temp[target_col], errors='coerce')
-                        if operator == ">": mask = df_temp[target_col] > val_X
-                        elif operator == "<": mask = df_temp[target_col] < val_X
-                        elif operator == ">=": mask = df_temp[target_col] >= val_X
-                        elif operator == "<=": mask = df_temp[target_col] <= val_X
-                    elif condition == "Giá trị IQR (Outliers)":
-                        Q1 = df_temp[target_col].quantile(0.25)
-                        Q3 = df_temp[target_col].quantile(0.75)
-                        IQR = Q3 - Q1
-                        mask = (df_temp[target_col] < (Q1 - 1.5 * IQR)) | (df_temp[target_col] > (Q3 + 1.5 * IQR))
-
-                    # Bước 2: Thực thi
-                    if action_type == "Xóa (Drop)":
-                        df_temp = df_temp[~mask]
-                        st.success(f"Đã xóa {mask.sum()} dòng.")
+                    st.session_state['dfs'][df_name] = processed_df
+                    st.session_state['processed_files'].add(file.name)
+                    st.success(t(f"Processed: {file.name}", f"Đã xử lý: {file.name}"))
                     
-                    elif action_type == "Điền khuyết (Impute)":
-                        # Đưa các giá trị cần xử lý về NaN trước
-                        df_temp.loc[mask, target_col] = np.nan
-                        
-                        if impute_method == "mean": df_temp[target_col].fillna(df_temp[target_col].mean(), inplace=True)
-                        elif impute_method == "median": df_temp[target_col].fillna(df_temp[target_col].median(), inplace=True)
-                        elif impute_method == "mode": df_temp[target_col].fillna(df_temp[target_col].mode()[0], inplace=True)
-                        elif impute_method == "Giá trị nhập tay": df_temp[target_col].fillna(manual_val, inplace=True)
-                        elif impute_method == "LOCF (Forward fill)": df_temp[target_col].fillna(method='ffill', inplace=True)
-                        elif impute_method == "NOCB (Backward fill)": df_temp[target_col].fillna(method='bfill', inplace=True)
-                        elif impute_method == "Linear Interpolation": df_temp[target_col].interpolate(method='linear', inplace=True)
-                        elif impute_method == "KNN":
-                            # KNN yêu cầu dữ liệu số
-                            imputer = KNNImputer(n_neighbors=5)
-                            df_temp[target_col] = imputer.fit_transform(df_temp[[target_col]])
-                        st.success("Impute thành công!")
-
-                    # Cập nhật lại Session State
-                    st.session_state.dfs[selected_table] = df_temp
-                    st.rerun()
-
                 except Exception as e:
-                    st.error(f"Có lỗi xảy ra trong quá trình xử lý: {e}")
+                    st.error(t(f"Error reading {file.name}: {e}", f"Lỗi đọc {file.name}: {e}"))
+        
+        # Display Stats for all uploaded DataFrames
+        for df_name, df in st.session_state['dfs'].items():
+            if df_name in [f.name.split('.')[0].replace(" ", "_") for f in uploaded_files]:
+                with st.expander(t(f"📊 Stats: {df_name}", f"📊 Thống kê: {df_name}"), expanded=False):
+                    stats_df = pd.DataFrame(index=df.columns)
+                    stats_df['Type'] = df.dtypes
+                    stats_df['Count'] = df.count()
+                    stats_df['NaN_Count'] = df.isna().sum()
+                    stats_df['Unique'] = df.nunique()
+                    
+                    numeric_cols = df.select_dtypes(include=['number']).columns
+                    for ct in ['Mean', 'Min', '25% (Q1)', '50% (Med)', '75% (Q3)', 'Max']:
+                        stats_df[ct] = np.nan
+                        
+                    if len(numeric_cols) > 0:
+                        desc = df[numeric_cols].describe().T
+                        stats_df.update(desc.rename(columns={'mean':'Mean', 'min':'Min', '25%':'25% (Q1)', '50%':'50% (Med)', '75%':'75% (Q3)', 'max':'Max'}))
+                    
+                    st.dataframe(stats_df.round(2))
 
-# --- TAB 3: VISUALIZE ---
-with tab3:
-    st.info("Khu vực phát triển biểu đồ Visualize (Sẽ cập nhật sau).")
+# 2. MAIN AREA (CHAT, MANUAL CHARTS, & EXPORT PANEL)
+col_chat, col_export = st.columns([3, 1], gap="large")
 
-
-# =============================================================================
-# 6. CHATBOT GIAO DIỆN NỔI (Sử dụng st.popover)
-# =============================================================================
-st.markdown('<div class="floating-chat">', unsafe_allow_html=True)
-with st.popover("💬 Trợ lý Gemini"):
-    st.markdown("**Trợ lý phân tích dữ liệu**")
+# --- RIGHT PANEL: GENERATED FILES (DOWNLOADS) ---
+with col_export:
+    st.subheader(t("💾 Processed Data", "💾 Dữ Liệu Đã Xử Lý"))
+    st.markdown(t("DataFrames generated by AI will appear here.", "Các DataFrame do AI tạo ra sẽ hiển thị ở đây."))
     
-    # Hiển thị lịch sử
-    for msg in st.session_state.chat_history:
-        st.chat_message(msg["role"]).write(msg["content"])
+    if st.session_state['dfs']:
+        for df_name, df_data in st.session_state['dfs'].items():
+            with st.expander(f"📄 {df_name}", expanded=True):
+                st.caption(f"{df_data.shape[0]} rows x {df_data.shape[1]} cols")
+                csv_data = df_data.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label=t("Download CSV", "Tải CSV"),
+                    data=csv_data,
+                    file_name=f"{df_name}.csv",
+                    mime='text/csv',
+                    key=f"dl_{df_name}"
+                )
+    else:
+        st.info(t("No data available yet.", "Chưa có dữ liệu."))
+
+# --- MIDDLE PANEL: AI CHAT ---
+with col_chat:
+    st.subheader(t("2. Chat With Data Agent", "2. Chat Với Data Agent"))
+    chat_container = st.container(height=500)
+    
+    for message in st.session_state['chat_history']:
+        if message["role"] != "system": # Hide system context messages from UI
+            with chat_container.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+    if user_prompt := st.chat_input(t("e.g., 'Filter sales > 1000 and save as high_sales'", "VD: 'Lọc doanh thu > 1000 và lưu thành bảng high_sales'")):
         
-    prompt = st.chat_input("Hỏi tôi về bộ dữ liệu của bạn...")
-    if prompt:
-        st.chat_message("user").write(prompt)
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        st.session_state['chat_history'].append({"role": "user", "content": user_prompt})
+        with chat_container.chat_message("user"):
+            st.markdown(user_prompt)
+
+        with chat_container.chat_message("assistant"):
+            with st.spinner(t("AI is analyzing...", "AI đang phân tích...")):
+                # Construct System Prompt with current schema
+                df_schemas = []
+                for name, d in st.session_state['dfs'].items():
+                    cols = ", ".join([f"'{c}' ({dt})" for c, dt in zip(d.columns, d.dtypes)])
+                    df_schemas.append(f"DataFrame '{name}': {cols}")
+                schema_context = "\n".join(df_schemas)
+                
+                system_instruction = f"""
+                You are an expert Data Analyst AI. You have access to a dictionary of DataFrames named `dfs`.
+                Current available dataframes:
+                {schema_context}
+                
+                INSTRUCTIONS:
+                - To analyze data, create charts, or modify data, output Python code wrapped in ```python ... ```.
+                - NEVER use pd.read_csv. Only use data inside the `dfs` dictionary (e.g., `df = dfs['my_data']`).
+                - To create a NEW dataframe for the user to download (e.g. filtering, imputing, aggregating), simply assign it to a new key in `dfs`. Example: `dfs['new_table'] = dfs['old_table'].dropna()`. Do NOT reassign the `dfs` variable itself.
+                - To plot, use `plotly.express` (imported as `px`) and render with `st.plotly_chart(fig)`.
+                - Print any direct text answers inside the python code using `print()`.
+                """
+
+                # Format history for Gemini API
+                formatted_history = []
+                for msg in st.session_state['chat_history'][:-1]: # exclude the latest prompt
+                    role = "user" if msg["role"] == "user" else "model"
+                    formatted_history.append({"role": role, "parts": [msg["content"]]})
+
+                chat_session = model.start_chat(history=formatted_history)
+                response = chat_session.send_message(system_instruction + "\n\nUser request: " + user_prompt)
+                
+                response_text = response.text
+                
+                # Check if AI generated code
+                code_match = re.search(r"```python\n(.*?)\n```", response_text, re.DOTALL)
+                
+                if code_match:
+                    code = code_match.group(1)
+                    with st.expander(t("🛠️ View AI Python Code", "🛠️ Xem mã Python AI sinh ra"), expanded=False):
+                        st.code(code, language="python")
+                    
+                    with st.spinner(t("🔄 Executing code...", "🔄 Đang chạy code...")):
+                        execution_output, new_dfs = run_python_code_safely(code)
+                    
+                    if execution_output:
+                        if execution_output.startswith("❌"):
+                            st.error(execution_output)
+                            final_display = execution_output
+                        else:
+                            st.write(t("**📊 Execution Output:**", "**📊 Kết quả chạy code:**"))
+                            st.code(execution_output, language="text")
+                            final_display = f"{response_text}\n\n**Output:**\n```text\n{execution_output}\n```"
+                    else:
+                        final_display = response_text
+                        st.markdown(response_text.replace(f"```python\n{code}\n```", ""))
+                    
+                    # If new dataframes were created, feed that info back to the model's memory
+                    if new_dfs:
+                        new_schemas = []
+                        for n in new_dfs:
+                            cols = ", ".join(st.session_state['dfs'][n].columns)
+                            new_schemas.append(f"'{n}' with columns: {cols}")
+                        sys_msg = f"System Update: Successfully created and saved new dataframes: {', '.join(new_schemas)}. The user can now see and download them."
+                        st.session_state['chat_history'].append({"role": "system", "content": sys_msg})
+                        st.success(t(f"Successfully generated new tables: {', '.join(new_dfs)}", f"Đã tạo bảng mới thành công: {', '.join(new_dfs)}"))
+                else:
+                    final_display = response_text
+                    st.markdown(final_display)
+
+                st.session_state['chat_history'].append({"role": "assistant", "content": final_display})
+
+# 3. BOTTOM PANEL (MANUAL CHART BUILDER)
+st.divider()
+st.subheader(t("3. Manual Chart Builder", "3. Trình Tạo Biểu Đồ Thủ Công"))
+st.markdown(t("Select any available dataframe below to instantly generate interactive charts.", "Chọn bất kỳ bảng dữ liệu nào dưới đây để tạo biểu đồ tương tác."))
+
+if st.session_state['dfs']:
+    build_col1, build_col2, build_col3, build_col4, build_col5 = st.columns(5)
+    
+    with build_col1:
+        target_df_name = st.selectbox(t("Select DataFrame", "Chọn Bảng"), list(st.session_state['dfs'].keys()))
+    
+    if target_df_name:
+        target_df = st.session_state['dfs'][target_df_name]
+        all_cols = target_df.columns.tolist()
+        num_cols = target_df.select_dtypes(include=['number']).columns.tolist()
         
-        # Mô phỏng phản hồi (Bạn sẽ tích hợp genai.generate_content tại đây)
-        # Nếu prompt có nhắc đến "thống kê", bạn có thể gọi hàm get_desc_stats()
-        response = f"Đây là phản hồi giả lập từ Gemini cho câu hỏi: '{prompt}'. Để bot tự động chuyển tab, bạn cần tích hợp Function Calling của Gemini SDK."
-        
-        st.chat_message("assistant").write(response)
-        st.session_state.chat_history.append({"role": "assistant", "content": response})
-st.markdown('</div>', unsafe_allow_html=True)
+        with build_col2:
+            x_col = st.selectbox(t("X-Axis", "Trục X"), all_cols)
+        with build_col3:
+            y_col = st.selectbox(t("Y-Axis", "Trục Y"), all_cols)
+        with build_col4:
+            chart_type = st.selectbox(t("Chart Type", "Loại Biểu Đồ"), ["Scatter", "Line", "Bar", "Box", "Histogram"])
+        with build_col5:
+            st.write("")
+            st.write("") # Spacing alignment
+            generate_btn = st.button(t("Complete & Draw", "Hoàn tất & Vẽ"), use_container_width=True)
+            
+        if generate_btn:
+            try:
+                if chart_type == "Scatter":
+                    fig = px.scatter(target_df, x=x_col, y=y_col, title=f"Scatter: {y_col} vs {x_col}")
+                elif chart_type == "Line":
+                    fig = px.line(target_df, x=x_col, y=y_col, title=f"Line: {y_col} over {x_col}")
+                elif chart_type == "Bar":
+                    fig = px.bar(target_df, x=x_col, y=y_col, title=f"Bar: {y_col} by {x_col}")
+                elif chart_type == "Box":
+                    fig = px.box(target_df, x=x_col, y=y_col, title=f"Boxplot: {y_col} grouped by {x_col}")
+                elif chart_type == "Histogram":
+                    fig = px.histogram(target_df, x=x_col, title=f"Histogram: Distribution of {x_col}")
+                
+                # Render using Streamlit's Plotly container for built-in interactivity
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.error(t(f"Could not generate chart: {e}", f"Không thể tạo biểu đồ: {e}"))
+else:
+    st.info(t("Upload a file first to use the Chart Builder.", "Tải lên một file để sử dụng Trình Tạo Biểu Đồ."))
