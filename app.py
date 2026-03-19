@@ -22,7 +22,7 @@ def t(en: str, vi: str) -> str:
 load_dotenv()
 gemini_key = os.getenv("GEMINI_KEY")
 if not gemini_key:
-    st.error(t("GEMINI KEY is not configured in the .env file.", "Chưa cấu hình GEMINI API KEY trong file .env"))
+    st.error(t("GEMINI API KEY is not configured in the .env file.", "Chưa cấu hình GEMINI API KEY trong file .env"))
     st.stop()
 
 genai.configure(api_key=gemini_key)
