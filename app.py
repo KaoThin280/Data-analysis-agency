@@ -9,6 +9,9 @@ import plotly.express as px
 import google.generativeai as genai
 from dotenv import load_dotenv
 import os
+from statsmodels.tsa.seasonal import seasonal_decompose
+import warnings
+warnings.filterwarnings('ignore')
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="AI Data Analyst Agency", layout="wide", initial_sidebar_state="expanded")
@@ -20,10 +23,12 @@ def t(en: str, vi: str) -> str:
 
 # --- API SECURITY & SETUP ---
 load_dotenv()
-if "GEMINI_KEY" in st.secrets:
-    gemini_key = st.secrets["GEMINI_KEY"]
-else:
-    gemini_key = os.getenv("GEMINI_KEY")
+# if "GEMINI_KEY" in st.secrets:
+#     gemini_key = st.secrets["GEMINI_KEY"]
+# else:
+#     gemini_key = os.getenv("GEMINI_KEY")
+
+gemini_key = os.getenv("GEMINI_KEY")
 
 if not gemini_key:
     # Tôi đã gộp thông báo lỗi để cho cả 2 trường hợp
@@ -69,6 +74,24 @@ def identify_and_convert_datetime(df: pd.DataFrame, filename: str) -> pd.DataFra
     except Exception as e:
         print(f"Datetime LLM Error: {e}")
     return df
+# --- HELPER: VIETNAM HOLIDAY CALENDAR ---
+def get_vietnam_holidays(year: int) -> dict:
+    """Returns Vietnam holidays for a given year"""
+    return {
+        'Tết Nguyên Đán': f'{year}-02-10',  # Lunar New Year (approximate)
+        'Giỗ Tổ Hùng Vương': f'{year}-04-18',
+        'Ngày Quốc Tế Lao Động': f'{year}-05-01',
+        'Ngày Quốc Khánh': f'{year}-09-02',
+        'Noel': f'{year}-12-25',
+    }
+
+def get_international_holidays(year: int) -> dict:
+    """Returns major international holidays"""
+    return {
+        'New Year': f'{year}-01-01',
+        'Easter': f'{year}-04-09',  # Approximate
+        'Christmas': f'{year}-12-25',
+    }
 
 # --- HELPER: SAFE PYTHON EXECUTION ---
 def run_python_code_safely(code: str) -> tuple[str, list]:
@@ -86,13 +109,14 @@ def run_python_code_safely(code: str) -> tuple[str, list]:
         'px': px,
         'st': st,
         'dfs': st.session_state['dfs'], # Pass the dictionary of all dataframes
+        'seasonal_decompose': seasonal_decompose,
         '__builtins__': __builtins__
     }
 
     try:
         # Pre-process code to remove markdown wrappers if AI included them
         clean_code = re.sub(r"^```python\n|```$", "", code, flags=re.MULTILINE).strip()
-        exec(clean_code, safe_globals, {})
+        exec(clean_code, safe_globals, safe_globals)
         output = redirected_output.getvalue()
         
         # Check if AI created new dataframes in the 'dfs' dictionary
@@ -220,16 +244,28 @@ with col_chat:
                 schema_context = "\n".join(df_schemas)
                 
                 system_instruction = f"""
-                You are an expert Data Analyst AI. You have access to a dictionary of DataFrames named `dfs`.
+                You are an expert Data Analyst AI specialized in Time Series Analysis and Holiday Impact Analysis.
+                You have access to a dictionary of DataFrames named `dfs`.
                 Current available dataframes:
                 {schema_context}
                 
+                SPECIAL CAPABILITIES:
+                1. TIME SERIES DECOMPOSITION:
+                   - Use `seasonal_decompose(series, model='additive', period=...)` for trend, seasonal, residual analysis
+                   - Visualize components using plotly
+                   
+                2. HOLIDAY ANALYSIS:
+                   - Vietnam Holidays: Tết (Feb 10), Giỗ Tổ Hùng Vương (Apr 18), Quốc Tế Lao Động (May 1), Quốc Khánh (Sep 2)
+                   - If data has a date column, identify anomalies around holidays
+                   - Create segments: holiday_period, pre_holiday, post_holiday, regular days
+                   
                 INSTRUCTIONS:
                 - To analyze data, create charts, or modify data, output Python code wrapped in ```python ... ```.
                 - NEVER use pd.read_csv. Only use data inside the `dfs` dictionary (e.g., `df = dfs['my_data']`).
-                - To create a NEW dataframe for the user to download (e.g. filtering, imputing, aggregating), simply assign it to a new key in `dfs`. Example: `dfs['new_table'] = dfs['old_table'].dropna()`. Do NOT reassign the `dfs` variable itself.
-                - To plot, use `plotly.express` (imported as `px`) and render with `st.plotly_chart(fig)`.
-                - Print any direct text answers inside the python code using `print()`.
+                - To create a NEW dataframe, assign it to a new key in `dfs`. Example: `dfs['new_table'] = dfs['old_table'].dropna()`.
+                - To plot, use `plotly.express` (imported as `px`) and `st.plotly_chart(fig)`.
+                - For time series, ensure date column is datetime type before decomposing.
+                - Print any text answers using `print()`.
                 """
 
                 # Format history for Gemini API
