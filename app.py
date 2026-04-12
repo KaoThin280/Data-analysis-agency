@@ -9,7 +9,7 @@ import plotly.express as px
 from google import genai
 from dotenv import load_dotenv
 import os
-import matplotlib.pyplot as plt
+import matplotlib as plt
 from statsmodels.tsa.seasonal import seasonal_decompose
 import warnings
 warnings.filterwarnings('ignore')
