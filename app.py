@@ -236,192 +236,96 @@ with col_chat:
             st.markdown(user_prompt)
 
         with chat_container.chat_message("assistant"):
-            with st.spinner(t("AI is analyzing...", "AI đang phân tích...")):
-                # Construct System Prompt with current schema
-                df_schemas = []
-                for name, d in st.session_state['dfs'].items():
-                    cols = ", ".join([f"'{c}' ({dt})" for c, dt in zip(d.columns, d.dtypes)])
-                    df_schemas.append(f"DataFrame '{name}': {cols}")
-                schema_context = "\n".join(df_schemas)
-                
-                system_instruction = f"""
-                You are an expert Data Analyst AI specialized in Time Series Analysis and Holiday Impact Analysis.
-                You have access to a dictionary of DataFrames named `dfs`.
-                Current available dataframes:
-                {schema_context}
-                
-                SPECIAL CAPABILITIES:
-                1. TIME SERIES DECOMPOSITION:
-                   - Use `seasonal_decompose(series, model='additive', period=...)` for trend, seasonal, residual analysis
-                   - Visualize components using plotly
-                   
-                2. HOLIDAY ANALYSIS:
-                   - Vietnam Holidays: Tết (Feb 10), Giỗ Tổ Hùng Vương (Apr 18), Quốc Tế Lao Động (May 1), Quốc Khánh (Sep 2)
-                   - If data has a date column, identify anomalies around holidays
-                   - Create segments: holiday_period, pre_holiday, post_holiday, regular days
-                   
-                INSTRUCTIONS:
-                - To analyze data, create charts, or modify data, output Python code wrapped in ```python ... ```.
-                - NEVER use pd.read_csv. Only use data inside the `dfs` dictionary (e.g., `df = dfs['my_data']`).
-                - To create a NEW dataframe, assign it to a new key in `dfs`. Example: `dfs['new_table'] = dfs['old_table'].dropna()`.
-                - To plot, use `plotly.express` (imported as `px`) and `st.plotly_chart(fig)`.
-                - For time series, ensure date column is datetime type before decomposing.
-                - Print any text answers using `print()`.
-                """
+            MAX_RETRIES = 3 
+            is_resolved = False
+            current_prompt = user_prompt
+            final_display = ""
+            final_code = ""
+            final_error = ""
 
-                # Format history for Gemini API
-                formatted_history = []
-                for msg in st.session_state['chat_history'][:-1]: # exclude the latest prompt
-                    role = "user" if msg["role"] == "user" else "model"
-                    # Đã sửa: Gói nội dung string vào trong một dictionary với key là "text"
-                    formatted_history.append({"role": role, "parts": [{"text": msg["content"]}]})
+            # Tạo một vùng trống tạm thời để hiển thị trạng thái ngầm (không lưu vào lịch sử chat)
+            status_placeholder = st.empty()
+            
+            with st.spinner(t("AI đang phân tích và thực thi...", "AI is analyzing and executing...")):
+                for attempt in range(MAX_RETRIES):
+                    # Chỉ cập nhật dòng trạng thái tạm thời để user biết AI đang làm việc
+                    if attempt > 0:
+                        status_placeholder.info(t(f"🛠️ Đang tối ưu hóa và sửa lỗi (Lần {attempt + 1}/{MAX_RETRIES})...", 
+                                                  f"🛠️ Optimizing and fixing errors (Attempt {attempt + 1}/{MAX_RETRIES})..."))
 
-                # Tạo phiên chat và truyền system_instruction một cách chính thống qua config
-                system_instruction = f"""
-                    You are an expert Data Analyst AI specialized in Time Series Analysis and Holiday Impact Analysis.
-                    You have access to a dictionary of DataFrames named `dfs`.
-                    Current available dataframes:
-                    {schema_context}
-
-                    SPECIAL CAPABILITIES:
-                    [... Giữ nguyên các nội dung cũ của bạn ở đây ...]
-
-                    3. ERROR HANDLING & MISSING LIBRARIES (CRITICAL):
-                    - Nếu bạn nhận được phản hồi lỗi từ hệ thống, hãy phân tích log lỗi và viết lại toàn bộ đoạn code Python để sửa nó.
-                    - Nếu lỗi là `ModuleNotFoundError` hoặc `ImportError` (yêu cầu một thư viện không có sẵn trong môi trường như pandas, numpy, plotly, statsmodels, streamlit), BẠN KHÔNG ĐƯỢC sinh ra code để `pip install`.
-                    - Lúc này, hãy DỪNG viết code. Trả lời người dùng hoàn toàn bằng văn bản (tiếng Việt): Giải thích chi tiết thư viện nào đang thiếu, thư viện đó dùng để làm gì trong tác vụ này, và hướng dẫn họ cài đặt thủ công ở terminal trước khi thử lại.
-                    """
-                chat_session = client.chats.create(
-                    model=MODEL_NAME,
-                    history=formatted_history,
-                    config={
-                        "system_instruction": system_instruction,
-                        "temperature": 0.2  # Tuỳ chọn: Giảm temperature để AI viết code chính xác/ổn định hơn
-                    }
-                )
-                
-                # Gửi trực tiếp user_prompt (không cần phải cộng chuỗi với system_instruction nữa)
-                #response = chat_session.send_message(user_prompt)
-                
-                with chat_container.chat_message("assistant"):
-                # Cấu hình số lần AI được phép tự sửa lỗi
-                    MAX_RETRIES = 3 
-                    is_resolved = False
-                    current_prompt = user_prompt # Bắt đầu với prompt của user
-                    final_display = ""
-
-                with st.spinner(t("AI đang phân tích và thực thi...", "AI is analyzing and executing...")):
-                    for attempt in range(MAX_RETRIES):
-                        # Gửi prompt (lần 1 là lệnh của user, các lần sau là log lỗi)
-                        response = chat_session.send_message(current_prompt)
-                        response_text = response.text
+                    response = chat_session.send_message(current_prompt)
+                    response_text = response.text
                     
-                        # Tìm code Python trong câu trả lời
-                        code_match = re.search(r"```python\n(.*?)\n```", response_text, re.DOTALL)
+                    code_match = re.search(r"```python\n(.*?)\n```", response_text, re.DOTALL)
                     
-                        if code_match:
-                            code = code_match.group(1)
-                            if attempt > 0:
-                                st.write(f"🔄 **AI đang thử sửa lỗi (Lần {attempt + 1}/{MAX_RETRIES})...**")
+                    if code_match:
+                        code = code_match.group(1)
+                        final_code = code # Cập nhật mã code mới nhất
                         
-                            with st.expander(t("🛠️ View AI Python Code", "🛠️ Xem mã Python AI sinh ra"), expanded=(attempt==0)):
-                                st.code(code, language="python")
-                        
-                            # Chạy thử code
-                            execution_output, new_dfs = run_python_code_safely(code)
-                        
-                            # KIỂM TRA LỖI
-                            if execution_output and execution_output.startswith("❌"):
-                                error_details = execution_output
-                            
-                                # Kiểm tra xem có phải lỗi thiếu thư viện không
-                                if "ModuleNotFoundError" in error_details or "ImportError" in error_details:
-                                    current_prompt = f"Hệ thống báo lỗi thiếu thư viện:\n{error_details}\nHãy làm theo chỉ thị: Không viết code nữa, hãy giải thích cho người dùng thư viện nào thiếu và vì sao không thể thực hiện."
-                                    continue # Cho AI giải thích bằng text ở vòng lặp tiếp theo
-                                
-                                # Nếu là lỗi logic code thông thường -> Báo AI sửa
-                                st.warning(t(f"Lần {attempt + 1}: Phát hiện lỗi. AI đang tự động đọc lỗi và sửa code...", f"Attempt {attempt + 1}: Error detected. AI is self-correcting..."))
-                                current_prompt = f"Code vừa rồi gặp lỗi sau:\n```text\n{error_details}\n```\nHãy phân tích nguyên nhân, và CUNG CẤP LẠI TOÀN BỘ đoạn code Python đã được sửa lỗi."
-                                continue # Quay lại đầu vòng lặp để thử gửi current_prompt mới
-                        
-                            # THÀNH CÔNG (Không có lỗi)
-                            else:
-                                st.success(t("✅ Đã chạy code thành công!", "✅ Execution successful!"))
-                                if execution_output:
-                                    st.write(t("**📊 Kết quả chạy code:**", "**📊 Execution Output:**"))
-                                    st.code(execution_output, language="text")
-                                    final_display = f"{response_text}\n\n**Output:**\n```text\n{execution_output}\n```"
-                                else:
-                                    final_display = response_text
-                                    st.markdown(response_text.replace(f"```python\n{code}\n```", ""))
-                            
-                                # Cập nhật context nếu có DataFrame mới
-                                if new_dfs:
-                                    new_schemas = []
-                                    for n in new_dfs:
-                                        cols = ", ".join(st.session_state['dfs'][n].columns)
-                                        new_schemas.append(f"'{n}' with columns: {cols}")
-                                    sys_msg = f"System Update: Successfully created and saved new dataframes: {', '.join(new_schemas)}."
-                                    st.session_state['chat_history'].append({"role": "system", "content": sys_msg})
-                                    st.success(t(f"Đã tạo bảng mới thành công: {', '.join(new_dfs)}", f"Successfully generated new tables: {', '.join(new_dfs)}"))
-                            
-                                is_resolved = True
-                                break # Thoát vòng lặp vì đã thành công
-                            
-                        else:
-                            # Trường hợp AI chỉ trả lời bằng chữ (ví dụ: đang giải thích lỗi thiếu thư viện)
-                            final_display = response_text
-                            st.markdown(final_display)
-                            is_resolved = True
-                            break # Thoát vòng lặp
-                
-                    # NẾU VƯỢT QUÁ SỐ LẦN THỬ MÀ VẪN LỖI
-                    if not is_resolved:
-                        st.error(t("❌ AI đã thử sửa lỗi nhiều lần nhưng không thành công. Dưới đây là lỗi cuối cùng:", "❌ AI tried multiple times but failed. Final error:"))
-                        st.code(error_details, language="text")
-                        final_display = f"Đã thử sửa lỗi {MAX_RETRIES} lần nhưng không thành công. Lỗi cuối: {error_details}"
-
-                    # Lưu vào lịch sử chat
-                    st.session_state['chat_history'].append({"role": "assistant", "content": final_display})
-
-                response_text = response.text
-                
-                # Check if AI generated code
-                code_match = re.search(r"```python\n(.*?)\n```", response_text, re.DOTALL)
-                
-                if code_match:
-                    code = code_match.group(1)
-                    with st.expander(t("🛠️ View AI Python Code", "🛠️ Xem mã Python AI sinh ra"), expanded=False):
-                        st.code(code, language="python")
-                    
-                    with st.spinner(t("🔄 Executing code...", "🔄 Đang chạy code...")):
+                        # Chạy code ngầm (không in ra giao diện lúc này)
                         execution_output, new_dfs = run_python_code_safely(code)
-                    
-                    if execution_output:
-                        if execution_output.startswith("❌"):
-                            st.error(execution_output)
-                            final_display = execution_output
+                        
+                        if execution_output and execution_output.startswith("❌"):
+                            final_error = execution_output
+                            
+                            # Phân tích lỗi để tạo prompt cho lượt tiếp theo
+                            if "ModuleNotFoundError" in final_error or "ImportError" in final_error:
+                                current_prompt = f"Hệ thống báo lỗi thiếu thư viện:\n{final_error}\nHãy làm theo chỉ thị: Không viết code nữa, hãy giải thích cho người dùng thư viện nào thiếu và vì sao không thể thực hiện."
+                                continue
+                                
+                            current_prompt = f"Code vừa rồi gặp lỗi sau:\n```text\n{final_error}\n```\nHãy phân tích nguyên nhân, và CUNG CẤP LẠI TOÀN BỘ đoạn code Python đã được sửa lỗi."
+                            continue 
+                        
                         else:
-                            st.write(t("**📊 Execution Output:**", "**📊 Kết quả chạy code:**"))
-                            st.code(execution_output, language="text")
-                            final_display = f"{response_text}\n\n**Output:**\n```text\n{execution_output}\n```"
+                            # TÌNH HUỐNG THÀNH CÔNG: Xóa trạng thái tạm và in kết quả chính thức
+                            status_placeholder.empty() 
+                            
+                            with st.expander(t("🛠️ View AI Python Code", "🛠️ Xem mã Python AI sinh ra"), expanded=False):
+                                st.code(final_code, language="python")
+                                
+                            st.success(t("✅ Đã chạy code thành công!", "✅ Execution successful!"))
+                            
+                            if execution_output:
+                                st.write(t("**📊 Kết quả chạy code:**", "**📊 Execution Output:**"))
+                                st.code(execution_output, language="text")
+                                final_display = f"{response_text}\n\n**Output:**\n```text\n{execution_output}\n```"
+                            else:
+                                final_display = response_text
+                                st.markdown(response_text.replace(f"```python\n{final_code}\n```", ""))
+                            
+                            if new_dfs:
+                                new_schemas = []
+                                for n in new_dfs:
+                                    cols = ", ".join(st.session_state['dfs'][n].columns)
+                                    new_schemas.append(f"'{n}' with columns: {cols}")
+                                sys_msg = f"System Update: Successfully created and saved new dataframes: {', '.join(new_schemas)}."
+                                st.session_state['chat_history'].append({"role": "system", "content": sys_msg})
+                                st.success(t(f"Đã tạo bảng mới thành công: {', '.join(new_dfs)}", f"Successfully generated new tables: {', '.join(new_dfs)}"))
+                            
+                            is_resolved = True
+                            break
+                            
                     else:
+                        # AI quyết định chỉ trả lời bằng text (vd: giải thích lỗi thư viện)
+                        status_placeholder.empty()
                         final_display = response_text
-                        st.markdown(response_text.replace(f"```python\n{code}\n```", ""))
+                        st.markdown(final_display)
+                        is_resolved = True
+                        break 
+                
+                # TÌNH HUỐNG THẤT BẠI HOÀN TOÀN (hết số lần thử)
+                if not is_resolved:
+                    status_placeholder.empty()
+                    st.error(t("❌ AI đã thử phân tích nhiều lần nhưng không thành công. Chi tiết lỗi:", "❌ AI tried multiple times but failed. Final error:"))
                     
-                    # If new dataframes were created, feed that info back to the model's memory
-                    if new_dfs:
-                        new_schemas = []
-                        for n in new_dfs:
-                            cols = ", ".join(st.session_state['dfs'][n].columns)
-                            new_schemas.append(f"'{n}' with columns: {cols}")
-                        sys_msg = f"System Update: Successfully created and saved new dataframes: {', '.join(new_schemas)}. The user can now see and download them."
-                        st.session_state['chat_history'].append({"role": "system", "content": sys_msg})
-                        st.success(t(f"Successfully generated new tables: {', '.join(new_dfs)}", f"Đã tạo bảng mới thành công: {', '.join(new_dfs)}"))
-                else:
-                    final_display = response_text
-                    st.markdown(final_display)
+                    if final_code: # Cho phép user xem đoạn code cuối cùng gây lỗi
+                        with st.expander(t("Mã code gây lỗi", "Error Code"), expanded=False):
+                            st.code(final_code, language="python")
+                            
+                    st.code(final_error, language="text")
+                    final_display = f"Đã thử sửa lỗi {MAX_RETRIES} lần nhưng không thành công. Lỗi cuối: {final_error}"
 
+                # LƯU VÀO LỊCH SỬ CHAT DUY NHẤT 1 LẦN (Kết quả cuối)
                 st.session_state['chat_history'].append({"role": "assistant", "content": final_display})
 
 # 3. BOTTOM PANEL (MANUAL CHART BUILDER)
