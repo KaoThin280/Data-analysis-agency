@@ -9,6 +9,7 @@ import plotly.express as px
 from google import genai
 from dotenv import load_dotenv
 import os
+import matplotlib.pyplot as plt
 from statsmodels.tsa.seasonal import seasonal_decompose
 import warnings
 warnings.filterwarnings('ignore')
@@ -382,7 +383,7 @@ with col_chat:
 
                     # Lưu vào lịch sử chat
                     st.session_state['chat_history'].append({"role": "assistant", "content": final_display})
-                    
+
                 response_text = response.text
                 
                 # Check if AI generated code
