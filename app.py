@@ -39,7 +39,7 @@ client = genai.Client(api_key=gemini_key)
 
 # Using the requested model name. If the API rejects it, update to 'gemini-1.5-flash' or 'gemini-2.0-flash'
 MODEL_NAME = "gemini-3.1-flash-lite-preview"
-model = genai.GenerativeModel(MODEL_NAME)
+#model = genai.GenerativeModel(MODEL_NAME)
 
 # --- SESSION STATE INITIALIZATION ---
 if 'dfs' not in st.session_state:
