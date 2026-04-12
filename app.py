@@ -6,7 +6,7 @@ import io
 import sys
 import traceback
 import plotly.express as px
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 import os
 from statsmodels.tsa.seasonal import seasonal_decompose
@@ -35,7 +35,7 @@ if not gemini_key:
     st.error(t("GEMINI API KEY is not configured in Secrets or .env file.", "Chưa cấu hình GEMINI API KEY trong Streamlit Secrets hoặc file .env"))
     st.stop()
 
-genai.configure(api_key=gemini_key)
+client = genai.Client(api_key=gemini_key)
 
 # Using the requested model name. If the API rejects it, update to 'gemini-1.5-flash' or 'gemini-2.0-flash'
 MODEL_NAME = "gemini-3.1-flash-lite-preview"
@@ -274,8 +274,18 @@ with col_chat:
                     role = "user" if msg["role"] == "user" else "model"
                     formatted_history.append({"role": role, "parts": [msg["content"]]})
 
-                chat_session = model.start_chat(history=formatted_history)
-                response = chat_session.send_message(system_instruction + "\n\nUser request: " + user_prompt)
+                # Tạo phiên chat và truyền system_instruction một cách chính thống qua config
+                chat_session = client.chats.create(
+                    model=MODEL_NAME,
+                    history=formatted_history,
+                    config={
+                        "system_instruction": system_instruction,
+                        "temperature": 0.2  # Tuỳ chọn: Giảm temperature để AI viết code chính xác/ổn định hơn
+                    }
+                )
+                
+                # Gửi trực tiếp user_prompt (không cần phải cộng chuỗi với system_instruction nữa)
+                response = chat_session.send_message(user_prompt)
                 
                 response_text = response.text
                 

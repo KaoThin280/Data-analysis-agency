@@ -2,6 +2,6 @@ streamlit
 pandas
 numpy
 plotly
-google-generativeai
+google-genai
 python-dotenv
 statsmodels
