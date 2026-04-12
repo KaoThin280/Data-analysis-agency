@@ -272,7 +272,8 @@ with col_chat:
                 formatted_history = []
                 for msg in st.session_state['chat_history'][:-1]: # exclude the latest prompt
                     role = "user" if msg["role"] == "user" else "model"
-                    formatted_history.append({"role": role, "parts": [msg["content"]]})
+                    # Đã sửa: Gói nội dung string vào trong một dictionary với key là "text"
+                    formatted_history.append({"role": role, "parts": [{"text": msg["content"]}]})
 
                 # Tạo phiên chat và truyền system_instruction một cách chính thống qua config
                 chat_session = client.chats.create(
